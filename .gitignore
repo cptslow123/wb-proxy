@@ -1,0 +1,6 @@
+accounts/
+usage/
+__pycache__/
+*.pyc
+*.bak
+*.orig
