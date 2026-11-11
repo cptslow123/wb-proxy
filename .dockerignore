@@ -1,0 +1,21 @@
+# 构建上下文排除规则（Docker 只认 .dockerignore，不认 .gitignore）
+#
+# 1) 版本控制与 CI 元数据：不应进入镜像。更重要的是 .git/config 里可能带有
+#    访问令牌（例如 CI 检出时写入的 extraheader），一旦进镜像就等于公开凭据。
+.git
+.github
+.gitignore
+.dockerignore
+
+# 2) 运行期数据：真实账号凭据与用量库，属于宿主机 bind mount，绝不能进镜像。
+accounts/
+usage/
+
+# 3) 本地缓存与临时文件
+__pycache__/
+*.pyc
+*.pyo
+*.bak
+*.orig
+*.log
+.DS_Store
