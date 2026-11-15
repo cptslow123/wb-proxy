@@ -36,8 +36,15 @@ PRODUCT_CLI = "cli"
 VALID_PRODUCTS = (PRODUCT_DESKTOP, PRODUCT_VSCODE, PRODUCT_CLI)
 
 
-def normalize_product(value):
-    """把各种写法收敛成 'workbuddy'、'vscode' 或 'cli'。"""
+def normalize_product(value, realm=None):
+    """把各种写法收敛成 'workbuddy'、'vscode' 或 'cli'。
+
+    国际版（.ai 出口）实测只接受 CLI / VSCode 两种身份：
+      workbuddy(桌面端) -> 400 11-128 request illegal
+      cli               -> 200
+      vscode            -> 200
+    所以 realm=intl 时默认落到 CLI；国内版维持桌面端（历史行为不变）。
+    """
     v = str(value or "").strip().lower()
     if v in ("workbuddy", "wb", "desktop"):
         return PRODUCT_DESKTOP
@@ -45,7 +52,22 @@ def normalize_product(value):
         return PRODUCT_VSCODE
     if v in ("cli", "codebuddy"):
         return PRODUCT_CLI
+    # 没写或写了不认识的值：按区域给安全默认值
+    if str(realm or "").strip().lower() == "intl":
+        return PRODUCT_CLI
     return PRODUCT_DESKTOP
+
+
+def normalize_product_for_realm(value, realm):
+    """按区域收敛 product，并纠正 intl 下的桌面端身份。
+
+    存量的 intl 账号凭证档里写的是 workbuddy（桌面端）——那是旧默认值。
+    这类账号在 11-128 上会一直失败，读档时直接纠正成 CLI。
+    """
+    product = normalize_product(value, realm)
+    if str(realm or "").strip().lower() == "intl" and product == PRODUCT_DESKTOP:
+        return PRODUCT_CLI
+    return product
 
 
 _ENDPOINTS = {

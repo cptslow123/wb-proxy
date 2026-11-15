@@ -302,23 +302,64 @@ def deduction_end_text(acc):
         return ""
 
 
+def _host_of(value):
+    """取出 URL / 域名里的主机名，小写，去掉协议、端口和路径。"""
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    if "://" in text:
+        text = text.split("://", 1)[1]
+    text = text.split("/", 1)[0]
+    text = text.split("?", 1)[0]
+    text = text.split(":", 1)[0]
+    return text
+
+
+def realm_by_tld(value):
+    """按域名后缀判区域：只有一个规则，.ai=国际版，.cn=国内版。
+
+    只看主机名，不看路径。之前用 "workbuddy.ai" 这类整串做子串匹配，
+    遇到 issuer 是 https://www.workbuddy.ai/auth/realms/copilot 的账号时，
+    既命中国际版域名、路径里又带着 copilot，判定就飘了。
+    """
+    host = _host_of(value)
+    if not host:
+        return None
+    if host == "ai" or host.endswith(".ai"):
+        return "intl"
+    if host == "cn" or host.endswith(".cn"):
+        return "cn"
+    # copilot.tencent.com 是国内版的历史出口，没有 .cn 后缀
+    if host == "copilot.tencent.com" or host.endswith(".copilot.tencent.com"):
+        return "cn"
+    return None
+
+
 def realm_evidence(token, domain=None):
     """从 token / 域名里看区域，看不出返回 None（不要瞎猜成 intl）。
 
-    先看 token 自己的 issuer，再看域名：域名是客户端随手记下来的字段，可能过期
-    或干脆是另一边的（同一台机器切区登录过就会这样），token 才是要拿去请求的
-    那一串，冲突时以它为准。
+    判定顺序：
+      1. 域名后缀（.ai / .cn）——最可靠，用户口径就是按后缀区分；
+      2. token issuer 的后缀；
+      3. issuer 路径里的 realms/copilot 之类线索。
+    账号切换区域后 issuer 与 domain 可能不一致，域名优先能避免
+    国际版账号被当成国内版（或反过来）发错请求头。
     """
-    iss = jwt_issuer(token).lower()
-    if any(marker in iss for marker in CN_REALM_MARKERS):
+    dom = str(domain or "").strip()
+    by_domain = realm_by_tld(dom)
+    if by_domain:
+        return by_domain
+
+    iss = str(jwt_issuer(token) or "")
+    by_iss = realm_by_tld(iss)
+    if by_iss:
+        return by_iss
+
+    low_iss = iss.lower()
+    if "/realms/copilot" in low_iss or "copilot.tencent.com" in low_iss:
         return "cn"
-    if any(marker in iss for marker in INTL_REALM_MARKERS):
-        return "intl"
-    dom = str(domain or "").lower()
-    if any(marker in dom for marker in CN_REALM_MARKERS):
+    if any(marker in low_iss for marker in CN_REALM_MARKERS):
         return "cn"
-    if any(marker in dom for marker in INTL_REALM_MARKERS):
-        return "intl"
     return None
 
 def detect_realm_from_token(token, domain=None):
@@ -450,6 +491,32 @@ def unverified_soft_backoff(streak):
                                 SOFT_RATE_UNVERIFIED_MAX, 1)
 
 
+_CODE_RE = re.compile(r'"code"\s*:\s*"?([0-9A-Za-z_\-]{2,20})"?')
+
+
+def _error_code_of(reason, detail=""):
+    """从上游返回里抠出错误码，供面板直接显示。
+
+    上游的码有三种写法：纯数字 6004、带横杠 11-128、以及嵌在 JSON 里的
+    "code": "xxx"。这里按顺序找，找不到就退回状态码本身的文本。
+    """
+    for text in (str(detail or ""), str(reason or "")):
+        if not text:
+            continue
+        m = _CODE_RE.search(text)
+        if m:
+            return m.group(1)
+    text = str(reason or "")
+    if text:
+        return text[:40]
+    return ""
+
+
+def probe_error_code(detail="", reason=""):
+    """对外暴露的错误码提取（wb_proxy 用它给锁定的账号打标签）。"""
+    return _error_code_of(reason, detail)
+
+
 def breaker_backoff(fails):
     """Breaker cooldown for `fails` consecutive hard failures."""
     return _exponential_backoff(fails, BREAKER_COOLDOWN, BREAKER_COOLDOWN_MAX,
@@ -489,7 +556,8 @@ class Account(object):
         # 上次实际生效的那条通道，而不是每次都回到预设。
         # 凭证档没有这个栏位、或值不合法时 normalize_product() 会回退到
         # WorkBuddy 独立桌面端 (workbuddy)，升级前就已存在的帐号行为不变。
-        self.product = wb_identity.normalize_product(data.get("product"))
+        self.product = wb_identity.normalize_product_for_realm(
+            data.get("product"), self.realm)
         self.enterprise_id = str(data.get("enterpriseId") or "")
         self.access_token = token
         self.refresh_token = str(data.get("refreshToken") or "")
@@ -531,6 +599,8 @@ class Account(object):
         # it has always had; never persisted, never exported.
         self.last_error_detail = ""
         self.cooldown_until = 0.0
+        # 限流锁定的到期时间：到期后 _maybe_auto_recover 自动解锁
+        self.lock_until = 0.0
         # Per-model throttling. Upstream rate limits (code 6004 "usage exceeds
         # frequency limit") apply to ONE model for one account, not to the whole
         # account: other models keep working. Cooldown the offending model only,
@@ -566,6 +636,18 @@ class Account(object):
         # 其余 429（无重置时刻的软限流）不在这里。记录范围限免费模型
         # （FREE_CAP_MODELS，见 note_model_cap）。
         self.model_caps = {}
+        self.lock_until = float(data.get("lockUntil") or 0.0)
+        raw_cool = data.get("modelCooldowns") or {}
+        if isinstance(raw_cool, dict):
+            now0 = time.time()
+            for m, u in raw_cool.items():
+                try:
+                    u = float(u)
+                except (TypeError, ValueError):
+                    continue
+                # 只恢复还没到期的，过期的丢掉，避免重启后仍被挡住
+                if u > now0:
+                    self.model_cooldowns[m] = u
         for mid, entry in (data.get("modelCaps") or {}).items():
             if not isinstance(entry, dict):
                 continue
@@ -669,6 +751,10 @@ class Account(object):
             "lastActivityReport": self.last_activity_report,
             # 持久化：6004 的恢复时间是上游给的事实，重启后仍然成立（见 __init__）。
             "modelCaps": {mid: dict(entry) for mid, entry in self.model_caps.items()},
+            # 限流锁定的到期时间与模型冷却：不落盘的话重启后「停用原因」就没了，
+            # 自动解锁也永远等不到（lock_until 归零视为无需解锁）。
+            "lockUntil": self.lock_until,
+            "modelCooldowns": {m: u for m, u in self.model_cooldowns.items()},
         }
 
     def _throttle_snapshot(self, now):
@@ -717,6 +803,13 @@ class Account(object):
             "hasRefreshToken": bool(self.refresh_token),
             "lastError": last_error,
             "lastErrorDetail": last_error_detail or None,
+            # 面板直接显示这个：上游错误码（6004 / 11-128 / 11140 ...）。
+            # 没错误时为空串，界面就不用展示一堆没用的运行态字段。
+            "errorCode": (self._readable_reason() or self._derived_error_code()),
+            # 是否仍参与调度。停用或还在冷却/熔断里都算不可调度，
+            # 面板据此显示「已停止调度」而不是让人猜。
+            "schedulable": bool(self.enabled and deadline <= now
+                                and self.throttle_wait(model=None) <= 0),
             "inCooldown": deadline > now,
             "cooldownFor": round(max(0.0, deadline - now)) or None,
             "modelCooldowns": models,
@@ -1077,6 +1170,8 @@ class Account(object):
         return ""
 
     def ready(self, model=None):
+        # 自动恢复已关闭：账号是否可用由「主动探活」统一判定，
+        # 不再在这里悄悄放回池子，避免状态和面板不一致。
         if not self.enabled or not self.access_token:
             return False
         if self.throttle_wait(model=model) > 0:
@@ -1202,7 +1297,10 @@ class Account(object):
 
         身分会写回凭证档，重启后仍然有效。save() 需要目录参数。
         """
-        new = wb_identity.normalize_product(value)
+        new = wb_identity.normalize_product_for_realm(value, self.realm)
+        if new != wb_identity.normalize_product(value):
+            # intl 下桌面端身份会被上游 11-128 拒掉，如实告知并纠正
+            log("account %s: product workbuddy is not accepted on intl, using cli" % self.uid[:8])
         if new == self.product:
             return False
         self.product = new
@@ -2066,6 +2164,235 @@ class Account(object):
         with self._throttle_lock:
             self.unscoped_streak += 1
             return unverified_soft_backoff(self.unscoped_streak)
+
+    def _readable_reason(self):
+        """把停用原因转成一句人话，给面板直接显示。
+
+        上游的原始错误长这样：
+          {"code":6004,"msg":"usage exceeds frequency limit, ..."}
+        面板只显示 6004 等于没说，用户看不出是限流、封禁还是配置错。
+        这里统一成「<码> <一句话>，约 N 后恢复」。
+        """
+        code = _error_code_of(self.last_error or "",
+                              self.last_error_detail or "")
+        now = time.time()
+        # 恢复时间：优先用 lock_until，其次看模型冷却
+        until = 0.0
+        if self.lock_until and self.lock_until > now:
+            until = self.lock_until
+        else:
+            try:
+                cools = [u for u in self.model_cooldowns.values() if u > now]
+                if cools:
+                    until = max(cools)
+            except Exception:
+                pass
+
+        # 重启后 last_error 被剥掉，code 会是空的；但只要还在锁定期，
+        # 就说明是限流锁的，补回 6004，别让面板上只剩一句「已停用」。
+        if not code and until:
+            code = "6004"
+
+        label = {
+            "6004": "额度用尽",
+            "11-128": "请求被上游拦截",
+            "11140": "账号被上游限制",
+            "401": "凭据失效",
+            "403": "账号被拒绝",
+        }.get(code or "", "")
+
+        if not label and not until:
+            return code or ""
+
+        parts = []
+        if code:
+            parts.append(code)
+        if label:
+            parts.append(label)
+        text = " ".join(parts) if parts else "已停用"
+
+        if until:
+            mins = int((until - now) / 60)
+            if mins >= 60:
+                text += "，约 %d 小时后恢复" % (mins // 60)
+            elif mins > 0:
+                text += "，约 %d 分钟后恢复" % mins
+        return text
+
+    def _derived_error_code(self):
+        """重启后仍能给出停用原因的推导。
+
+        lastError 属于运行态，写盘时被剥掉（RUNTIME_ONLY_FIELDS），
+        所以进程重启后面板上「停用原因」会变空，看起来像是没记录。
+        这里用持久化的 lock_until / model_cooldowns 反推：
+        被限流锁住 -> 6004；否则只要还在锁定期就标为 locked。
+        """
+        if self.last_error:
+            return _error_code_of(self.last_error, self.last_error_detail or "")
+        if self.enabled:
+            return ""
+        now = time.time()
+        try:
+            cooling = [m for m, u in self.model_cooldowns.items() if u > now]
+        except Exception:
+            cooling = []
+        if cooling:
+            return "6004"
+        if self.lock_until and self.lock_until > now:
+            # 带恢复时间的锁定 = 上游限流/配额，给出人话原因而不是裸码
+            mins = int((self.lock_until - now) / 60)
+            if mins >= 60:
+                return "6004 额度用尽，约 %d 小时后恢复" % (mins // 60)
+            return "6004 额度用尽，约 %d 分钟后恢复" % max(1, mins)
+        return ""
+
+    def _maybe_auto_recover(self):
+        """限流到期后自动解除锁定。
+
+        429 会把 enabled 写成 False 并持久化。如果只锁不放，模型冷却到期了
+        账号也不会回池，池子会随着时间越用越空，只能人工点启用。
+        这里在判定可用性时先检查：当初因限流而锁、且所有模型冷却都过期，
+        就自动放回池子。
+        """
+        if self.enabled or not self.lock_until:
+            return
+        now = time.time()
+        if now < self.lock_until:
+            return
+        try:
+            if any(until > now for until in self.model_cooldowns.values()):
+                return
+        except Exception:
+            pass
+        with self._throttle_lock:
+            self.enabled = True
+            self.lock_until = 0.0
+            self.last_error = ""
+            self.last_error_detail = ""
+        self._persist_lock()
+
+    def _persist_lock(self):
+        """把 enabled=False 真正写回凭证档。
+
+        save() 需要 accounts 目录；账号对象自带 accounts_dir，
+        早期这里直接调用 self.save() 少了参数，异常又被吞掉，
+        结果文件里 enabled 一直是 True，重启后账号又活了。
+        """
+        directory = getattr(self, "accounts_dir", "") or ""
+        if not directory:
+            return False
+        try:
+            self.save(directory)
+            return True
+        except Exception as exc:
+            try:
+                import wb_proxy as _wb
+                _wb.log("account %s: persist lock failed: %s"
+                        % (str(self.uid)[:8], exc), level="WARN")
+            except Exception:
+                pass
+            return False
+
+    @staticmethod
+    def _parse_reset_epoch(detail):
+        """从上游 6004 的正文里解析重置时间，解析不出返回 0。
+
+        上游原文形如：将在 2026-11-15 12:44:52 UTC+8 重置
+        这是账号何时能回来的唯一权威信息，锁定时必须记下来，
+        否则自动恢复只能靠猜。
+        """
+        import re as _re
+        m = _re.search(
+            r"(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})",
+            str(detail or ""))
+        if not m:
+            return 0.0
+        try:
+            return float(time.mktime((
+                int(m.group(1)), int(m.group(2)), int(m.group(3)),
+                int(m.group(4)), int(m.group(5)), int(m.group(6)), 0, 0, -1)))
+        except Exception:
+            return 0.0
+
+    def lock_out(self, code, detail="", reason=""):
+        """把这个账号移出调度，并在状态里留下上游错误码。
+
+        与 probe_and_lock 的区别：这里不重新探活，调用方已经确认过失败。
+        停用是持久的（会写回凭证档），重启后仍然不参与调度，
+        避免一个坏号在重启后又被捞起来继续吃掉请求。
+        """
+        until = self._parse_reset_epoch(detail)
+        with self._throttle_lock:
+            self.last_error = ("%s: %s" % (code or "error",
+                                          str(reason or "locked")[:120]))[:200]
+            self.last_error_detail = str(detail or "")[:2000]
+            self.enabled = False
+            # 记下上游给的重置时间：到期由 _maybe_auto_recover 自动放回池子。
+            # 解析不出来（非 6004）就先锁 2 小时再试。
+            self.lock_until = until if until > time.time() else time.time() + 7200
+        self._persist_lock()
+        return True
+
+    def probe_and_lock(self, model, reason, detail=""):
+        """请求失败后主动探活一次：能复现就锁定该账号，停止调度。
+
+        这条路解决的是「账号看着健康、实际每次调用都失败」的问题：
+        面板上的 lastError 只在下次有人点探活时才更新，中途一直是空的，
+        调度器也会继续把请求派给它。这里在失败当下就复现一次，
+        确认不是偶发就把账号停用（enabled=False），池子立刻不再选它。
+
+        返回 (locked: bool, code: str)。code 是给面板显示的上游错误码。
+        """
+        code = _error_code_of(reason, detail)
+        if not model:
+            return False, code
+        try:
+            ok, probe_detail = self._probe_model_chat(model)
+        except Exception as exc:
+            probe_detail = "probe failed: %s" % exc
+            ok = False
+        if ok:
+            # 探活成功：说明这次失败是偶发（多半是并发/网络），不改状态。
+            return False, ""
+        # 复现了：锁定账号，并把上游原始错误留在 lastError 上给面板看
+        with self._throttle_lock:
+            self.last_error = ("%s: %s" % (code or "error",
+                                          str(reason)[:120]))[:200]
+            self.last_error_detail = str(probe_detail or detail or "")[:2000]
+            self.enabled = False
+            # 记住最晚的模型冷却到期时间，到点由 _maybe_auto_recover 自动解锁；
+            # 没有冷却信息（403 封禁等）就先锁 2 小时再重试。
+            untils = [u for u in self.model_cooldowns.values() if u > time.time()]
+            self.lock_until = max(untils) if untils else time.time() + 7200
+        self._persist_lock()
+        return True, code
+
+    def _probe_model_chat(self, model):
+        """用指定的模型真正打一次上游，返回 (ok, detail)。"""
+        import wb_proxy as _wb
+        url = self.chat_base_url() + _wb.CHAT_PATH
+        body = {
+            "model": model,
+            "messages": [{"role": "system", "content": "You are a helpful assistant."},
+                         {"role": "user", "content": "hi"}],
+            "stream": True,
+            "max_tokens": 5,
+        }
+        data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request(url, data=data, headers=self.headers("chat"),
+                                     method="POST")
+        try:
+            with urlopen(req, timeout=45, proxy=self.proxy) as resp:
+                resp.read(512)
+            return True, ""
+        except urllib.error.HTTPError as exc:
+            try:
+                body_text = exc.read().decode("utf-8", "replace")
+            except Exception:
+                body_text = ""
+            return False, "HTTP %d: %s" % (exc.code, body_text[:600])
+        except Exception as exc:
+            return False, str(exc)[:600]
 
     def note_failure(self, message):
         """5xx / transport failure: feed the breaker counter."""

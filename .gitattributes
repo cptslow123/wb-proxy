@@ -1,0 +1,9 @@
+# 统一为 LF：镜像在 Linux 上运行，CRLF 会让 python 解析异常/多出 \r
+* text=auto eol=lf
+*.py text eol=lf
+*.html text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.sh text eol=lf
+Dockerfile text eol=lf
+.gitignore text eol=lf

@@ -200,6 +200,7 @@ def exclusive_realm(model_id):
         return "cn"
     return ""
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import wb_taps
 from urllib.parse import urlparse, parse_qs
 def install_console_close_handler():
     """Release the port when the console window is closed by the user.
@@ -237,6 +238,8 @@ def install_console_close_handler():
         return None
 UPSTREAM = "https://www.workbuddy.ai"
 CHAT_PATH = "/v2/chat/completions"
+# 主动探活默认用这个模型：池子里最常见的付费模型，最能反映真实可用性
+DEFAULT_PROBE_MODEL = "deepseek-v4.1-flash"
 MODELS_PATH = "/v2/enterprises/personal/models"
 DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant."
 # The WorkBuddy AI desktop app caches its account product config here on every
@@ -9942,6 +9945,143 @@ def _log_db_active():
     return LOG_STORE is not None and LOG_STORE.enabled
 
 
+# ---------------------------------------------------------------- 主动探活定时
+PROBE_SCHEDULE_FILE = "probe_schedule.json"
+
+
+def _probe_schedule_path():
+    return os.path.join(ACCOUNTS_DIR, PROBE_SCHEDULE_FILE)
+
+
+def probe_schedule_read():
+    """读取探活定时配置：{"enabled": bool, "interval_minutes": int, "model": str}"""
+    cfg = {"enabled": False, "interval_minutes": 30, "model": DEFAULT_PROBE_MODEL,
+           "last_run_at": "", "last_summary": None}
+    try:
+        with open(_probe_schedule_path(), "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict):
+            cfg.update(data)
+    except Exception:
+        pass
+    return cfg
+
+
+def probe_schedule_write(cfg):
+    try:
+        with open(_probe_schedule_path(), "w", encoding="utf-8") as fh:
+            json.dump(cfg, fh, ensure_ascii=False, indent=2)
+        return True
+    except Exception as exc:
+        log("probe schedule save failed: %s" % exc, level="WARN")
+        return False
+
+
+_PROBE_LOOP_STARTED = False
+
+
+def start_probe_schedule_loop():
+    """后台线程：按配置的间隔对所有账号做一次主动探活。
+
+    放在网关进程里而不是 crontab，是因为间隔要能在面板上改；
+    crontab 改一次要动系统文件，也容易和别的任务撞。
+    """
+    global _PROBE_LOOP_STARTED
+    if _PROBE_LOOP_STARTED:
+        return
+    _PROBE_LOOP_STARTED = True
+
+    def loop():
+        while True:
+            try:
+                time.sleep(60)
+                cfg = probe_schedule_read()
+                if not cfg.get("enabled"):
+                    continue
+                try:
+                    interval = max(1, int(cfg.get("interval_minutes") or 30))
+                except (TypeError, ValueError):
+                    interval = 30
+                last = cfg.get("last_run_at") or ""
+                if last:
+                    try:
+                        prev = time.mktime(time.strptime(last, "%Y-%m-%d %H:%M:%S"))
+                    except Exception:
+                        prev = 0
+                    if time.time() - prev < interval * 60:
+                        continue
+                if POOL is None:
+                    continue
+                result = run_probe_all(model=cfg.get("model") or DEFAULT_PROBE_MODEL,
+                                       store=POOL)
+                cfg["last_run_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                cfg["last_summary"] = result.get("summary")
+                probe_schedule_write(cfg)
+                log("[定时探活] %s" % json.dumps(result.get("summary"), ensure_ascii=False))
+            except Exception as exc:
+                try:
+                    log("probe schedule loop error: %s" % exc, level="WARN")
+                except Exception:
+                    pass
+
+    t = threading.Thread(target=loop, name="probe-schedule", daemon=True)
+    t.start()
+
+
+def run_probe_all(model, store, realm_filter="", only_uid=""):
+    """对所有账号跑一次探活：通过就放回池子，429/403 就停用并记原因。"""
+    targets = []
+    for acc in store.accounts:
+        if only_uid and acc.uid != only_uid:
+            continue
+        if realm_filter and realm_filter != "all" and acc.realm != realm_filter:
+            continue
+        targets.append(acc)
+
+    results = []
+    stopped = resumed = 0
+    for acc in targets:
+        nick = acc.nickname or acc.uid[:8]
+        try:
+            ok, detail = acc._probe_model_chat(model)
+        except Exception as exc:
+            ok, detail = False, "probe error: %s" % exc
+
+        if ok:
+            if not acc.enabled:
+                resumed += 1
+            with acc._throttle_lock:
+                acc.enabled = True
+                acc.last_error = ""
+                acc.last_error_detail = ""
+                acc.lock_until = 0.0
+                try:
+                    acc.model_cooldowns.pop(model, None)
+                except Exception:
+                    pass
+            acc._persist_lock()
+            results.append({"uid": acc.uid, "nickname": nick, "ok": True,
+                            "action": "enabled"})
+            continue
+
+        code = wb_accounts.probe_error_code(detail)
+        until = acc._parse_reset_epoch(detail)
+        with acc._throttle_lock:
+            acc.last_error = ("%s: probe failed" % (code or "error"))[:200]
+            acc.last_error_detail = str(detail or "")[:2000]
+            acc.enabled = False
+            acc.lock_until = until if until > time.time() else time.time() + 7200
+        acc._persist_lock()
+        stopped += 1
+        results.append({"uid": acc.uid, "nickname": nick, "ok": False,
+                        "code": code, "error": str(detail or "")[:200],
+                        "action": "disabled"})
+
+    return {"model": model, "results": results,
+            "summary": {"total": len(targets), "stopped": stopped,
+                        "resumed": resumed}}
+
+
 def add_log_entry(msg, level=None, tag=None):
     global _LOG_COUNTER
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -10924,6 +11064,53 @@ def sanitize_tool_calls(tool_calls):
         else:
             out.append(tc)
     return out
+THINK_TAG_RE = re.compile(
+    r"(?is)<\s*thinking\s*>(.*?)<\s*/\s*thinking\s*>")
+
+# <final> 是模型自己吐的分隔标记，后面跟的是「还没写完的思考」。
+# 实测 1302 条样本里一条都没有 </final>，且多数以 </thinking> 收尾，
+# 说明客户端在丢弃开标签的同时把这一整段当成了正文。
+# 同理 </thinking> 单独出现时，它前面的内容也是思考。
+FINAL_TAG_RE = re.compile(r"(?is)<\s*final\s*>")
+ORPHAN_CLOSE_RE = re.compile(r"(?is)<\s*/\s*thinking\s*>")
+
+
+def strip_leaked_thinking(text):
+    """把客户端当成正文回传的 <thinking>…</thinking> 整段摘掉。
+
+    有些客户端（dsh 等）把上一轮的思考内容当普通文本存进 assistant 正文，
+    下一轮原样回传给上游。上游会把这坨思考当成正文里的“自言自语”，
+    表现为「思考链暴露到正文」，也更容易触发内容风控。
+    这里只从 messages 的历史里剥掉，不回填 reasoning_content——
+    回填会让上游认为这是它自己生成过的思考，反而更容易被判非法。
+    """
+    if not isinstance(text, str) or "<" not in text:
+        return text
+    low = text.lower()
+    if ("<thinking" not in low and "< think" not in low
+            and "<final" not in low and "</thinking" not in low):
+        return text
+    cleaned = THINK_TAG_RE.sub("", text)
+    # 半截 <final>：标签后全是未完成的思考，整段丢弃。
+    m = FINAL_TAG_RE.search(cleaned)
+    if m:
+        cleaned = cleaned[:m.start()]
+    # 只剩 </thinking>：它前面的内容同样是思考。
+    m = ORPHAN_CLOSE_RE.search(cleaned)
+    if m:
+        cleaned = cleaned[m.end():]
+    # 只写了一半（没闭合）的：从 <thinking> 起整段丢弃，避免半截思考泄进正文
+    for opener in ("<thinking", "< think"):
+        idx = cleaned.lower().find(opener)
+        while idx != -1:
+            tail = cleaned[idx:]
+            if THINK_TAG_RE.search(tail):
+                break
+            cleaned = cleaned[:idx]
+            idx = cleaned.lower().find(opener)
+    return cleaned.strip()
+
+
 def sanitize_messages(messages):
     out = []
     for m in messages or []:
@@ -10931,6 +11118,13 @@ def sanitize_messages(messages):
             item = dict(m)
             if "content" in item:
                 item["content"] = sanitize_content(item["content"])
+                # 客户端把思考当正文回传：剥掉，别让上游再吃一遍
+                if isinstance(item["content"], str):
+                    item["content"] = strip_leaked_thinking(item["content"])
+                elif isinstance(item["content"], list):
+                    for part in item["content"]:
+                        if isinstance(part, dict) and isinstance(part.get("text"), str):
+                            part["text"] = strip_leaked_thinking(part["text"])
             if isinstance(item.get("reasoning_content"), str):
                 item["reasoning_content"] = sanitize_text(item["reasoning_content"])
             if "tool_calls" in item:
@@ -12761,6 +12955,13 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                 # so sibling models stay serviceable on the same credential.
                 account.note_error("HTTP 429 (model throttled)", model=model, until=reset_at,
                                    cooldown=wait, detail=detail)
+                # 失败当下主动复现一次：确认是账号级问题就锁号，别让面板
+                # 一直显示健康、调度器继续把请求派过来。
+                locked, code = account.probe_and_lock(
+                    model, "HTTP 429 (model throttled)", detail)
+                if locked:
+                    log("account %s locked after 429 probe (code=%s)"
+                        % (account.uid[:8], code))
                 if reset_at:
                     # A cap with a reset clock is the one observable moment the
                     # window budget can be measured from; the usage rows alone
@@ -12812,6 +13013,11 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                     account.note_error("HTTP 403 (account restricted)",
                                        cooldown=RESTRICTED_403_COOLDOWN,
                                        single_account=(total <= 1), detail=detail)
+                    locked, code = account.probe_and_lock(
+                        model, "HTTP 403 (account restricted)", detail)
+                    if locked:
+                        log("account %s locked after 403 probe (code=%s)"
+                            % (account.uid[:8], code))
                     log("account %s restricted by upstream (403 11140), "
                         "cooling %.0fs" % (account.uid[:8], RESTRICTED_403_COOLDOWN))
                     if session_key and POOL:
@@ -17460,6 +17666,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._route_logs_clear(payload)
         if path == "/realm":
             return self._route_realm(payload)
+        if path == "/accounts/probe-all":
+            return self._route_accounts_probe_all(payload)
+        if path == "/accounts/probe/schedule":
+            return self._route_probe_schedule(payload)
         if path == "/accounts/checkin":
             return self._route_accounts_checkin(payload)
         if path == "/accounts/daily-chat":
@@ -17787,6 +17997,48 @@ class Handler(BaseHTTPRequestHandler):
             save_persisted_realm(new_realm)
         return self._json(200, {"ok": True, "current": CURRENT_REALM, "persisted": True})
 
+    def _route_accounts_probe_all(self, payload):
+        """主动探活所有账号（也可手动触发）。
+
+        通过 -> 放回池子；429/403 -> 停用并写清原因与恢复时间。
+        这样账号状态始终和上游一致，不必等「碰巧有请求打到它」。
+        """
+        if POOL is None:
+            return self._json(503, {"ok": False, "msg": "账号池不可用"})
+
+        model = (payload.get("model") or "").strip() or DEFAULT_PROBE_MODEL
+        realm = (payload.get("realm") or "").strip().lower()
+        uid = (payload.get("uid") or "").strip()
+
+        result = run_probe_all(model=model, store=POOL,
+                               realm_filter=realm, only_uid=uid)
+        add_log_entry("[主动探活] model=%s 共 %d 个账号，停用 %d，恢复 %d"
+                      % (model, result["summary"]["total"],
+                         result["summary"]["stopped"], result["summary"]["resumed"]),
+                      tag="accounts")
+        result["ok"] = True
+        result["accounts"] = account_views()
+        return self._json(200, result)
+
+    def _route_probe_schedule(self, payload):
+        """读写主动探活的定时配置。"""
+        if not isinstance(payload, dict):
+            return self._error(400, "expected a JSON object", "invalid_request_error")
+        cfg = probe_schedule_read()
+        if payload.get("_action") == "save" or "interval_minutes" in payload or "enabled" in payload:
+            if "enabled" in payload:
+                cfg["enabled"] = bool(payload.get("enabled"))
+            if "interval_minutes" in payload:
+                try:
+                    cfg["interval_minutes"] = max(1, int(payload.get("interval_minutes")))
+                except (TypeError, ValueError):
+                    return self._error(400, "interval_minutes must be an integer")
+            if "model" in payload:
+                cfg["model"] = str(payload.get("model") or DEFAULT_PROBE_MODEL)
+            if not probe_schedule_write(cfg):
+                return self._error(500, "could not save schedule")
+        return self._json(200, cfg)
+
     def _route_accounts_checkin(self, payload):
         uid = payload.get("uid")
         invalidate_tasks_cache()          # 签到会改连续打卡状态，成长任务快照随之作废
@@ -18020,7 +18272,10 @@ class Handler(BaseHTTPRequestHandler):
             # The label keeps its 80-char cut; `detail` rides along untouched so the
             # panel can show the whole upstream body on hover.
             account.note_error(f"HTTP {exc.code}: {detail[:80]}", cooldown=60, detail=detail)
-            log(f"account test: uid={account.uid[:8]} model={test_model} wall={wall_ms}ms error={exc.code}", level="WARN", tag="accounts")
+            # 手动探活失败就是「已复现」：直接停止调度，别让请求继续打到它身上。
+            account.lock_out(wb_accounts.probe_error_code(detail) or ("HTTP %d" % exc.code),
+                             detail, f"probe failed: HTTP {exc.code}")
+            log(f"account test: uid={account.uid[:8]} model={test_model} wall={wall_ms}ms error={exc.code} -> locked", level="WARN", tag="accounts")
             return self._json(200, {
                 "ok": False,
                 "uid": account.uid,
@@ -18175,6 +18430,7 @@ class Handler(BaseHTTPRequestHandler):
         all_tools.extend(additional_tools_from_input(payload))
         custom_names = custom_tool_names(all_tools)
         chat_req = responses_to_chat(payload)
+        wb_taps.tap_responses(self, payload, chat_req)
         ns_map = chat_req.pop("_namespace_map", None)
         # Echo these back on the response object; see chat_to_response.
         request_meta = {
@@ -18667,6 +18923,7 @@ class Handler(BaseHTTPRequestHandler):
         # Diagnostics: what the client actually asked for, and what we forward.
         # Only the knobs that change behaviour are logged - never message text.
         forwarded = build_upstream_body(payload)
+        wb_taps.tap_request(self, path, payload, forwarded)
         given = client_effort_of(payload) or payload.get("reasoning") \
             or payload.get("thinking") or payload.get("enable_thinking")
         log(
@@ -18822,6 +19079,7 @@ class Handler(BaseHTTPRequestHandler):
                         if isinstance(maybe, dict) else data)
                     if not cleaned:
                         continue
+                    wb_taps.tap_chunk(self, model, data, cleaned)
                     write_chunk(cleaned)
                 release(leak_filter.flush())
                 if synthesized_calls or pending_finish is not None:
@@ -19226,6 +19484,11 @@ def _serve_forever(args):
     # Keep the handler referenced for the process lifetime: SetConsoleCtrlHandler
     # stores a raw pointer, so a collected callback would crash on close.
     _ctrl_handler = install_console_close_handler()
+    # 启动主动探活定时线程（间隔存 accounts/probe_schedule.json，面板可改）
+    try:
+        start_probe_schedule_loop()
+    except Exception as _exc:
+        log("probe schedule start failed: %s" % _exc, level="WARN")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
