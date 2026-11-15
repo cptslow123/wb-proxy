@@ -11771,18 +11771,29 @@ class LeakedToolCallStreamFilter:
     """
 
     MAX_HOLD = 262144
+    # 扣留时间上限。只有 MAX_HOLD（字符数）是不够的：正文里一旦出现一个看起来
+    # 像泄漏工具调用的 "<"，这段文字就会停在 buf 里等着被判定，而流如果正好在
+    # 这期间断掉（上游 EOF、客户端超时），末尾的 flush() 根本走不到——用户看到
+    # 的就是「思考停在半句话」，后半段永久丢失。超过这个时限就无条件放出，
+    # 宁可漏掉一次工具调用识别，也不能让用户的正文消失。
+    MAX_HOLD_SECONDS = 2.0
 
     def __init__(self):
         self.buf = ""
+        self.hold_since = None
 
     def _release_all(self):
         out, self.buf = self.buf, ""
+        self.hold_since = None
         return [("text", out)] if out else []
 
     def feed(self, text):
         if not text:
             return []
         self.buf += text
+        now = time.time()
+        if self.hold_since is None:
+            self.hold_since = now
         for idx in range(len(self.buf)):
             if self.buf[idx] != "<":
                 continue
@@ -11790,11 +11801,14 @@ class LeakedToolCallStreamFilter:
                 continue
             if idx:
                 head, self.buf = self.buf[:idx], self.buf[idx:]
+                self.hold_since = now
                 return [("text", head)]
             break
         else:
             return self._release_all()
         if len(self.buf) > self.MAX_HOLD:
+            return self._release_all()
+        if now - self.hold_since > self.MAX_HOLD_SECONDS:
             return self._release_all()
         return []
 
@@ -11802,6 +11816,7 @@ class LeakedToolCallStreamFilter:
         if not self.buf:
             return []
         buf, self.buf = self.buf, ""
+        self.hold_since = None
         calls, clean = parse_leaked_tool_calls(buf)
         if not calls:
             calls, clean = parse_dsml_tool_calls(buf)
@@ -19085,6 +19100,14 @@ class Handler(BaseHTTPRequestHandler):
                 if synthesized_calls or pending_finish is not None:
                     write_chunk(chat_finish_chunk(
                         model, "tool_calls" if synthesized_calls else pending_finish))
+                elif emitted:
+                    # 上游整条流都没发过非空 finish_reason（只有 [DONE]、只有 usage、
+                    # 或直接 EOF）。严格客户端（DeepSeek Harness 等）要求流必须带
+                    # finish_reason，缺了就判 "Stream ended without finish_reason"
+                    # 并重试——服务端这边却因为看到 [DONE] 记成成功，于是失败被完全
+                    # 掩盖。这里补一帧 stop：截断时无法知道本该是什么，stop 语义最中
+                    # 性，也不会诱导客户端去执行不完整的工具调用。
+                    write_chunk(chat_finish_chunk(model, "stop"))
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                 # Client hung up; still account for what upstream produced.
                 wall = int((time.time() - t_start) * 1000)
@@ -19106,6 +19129,11 @@ class Handler(BaseHTTPRequestHandler):
                              fp=fp, outcome="upstream_aborted", key=self._key_id())
                 try:
                     flush_out()
+                    # 异常分支同样要补收尾帧：只写 [DONE] 的话，严格客户端仍然会
+                    # 因为整条流没有任何 finish_reason 而判定失败并重试。
+                    if emitted:
+                        self.wfile.write(
+                            ("data: %s\n\n" % chat_finish_chunk(model, "stop")).encode("utf-8"))
                     self.wfile.write(b"data: [DONE]\n\n")
                     self.wfile.flush()
                 except Exception:
